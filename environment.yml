@@ -1,0 +1,21 @@
+name: face_recog_env
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scipy
+  - scikit-learn
+  - opencv
+  - pillow
+  - pickleshare
+  - pip
+  - pip:
+      - dlib
+      - face-recognition
+      - imutils
+      - tqdm

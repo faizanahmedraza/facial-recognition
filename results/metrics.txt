@@ -1,0 +1,10 @@
+accuracy: 0.9474
+precision_macro: 0.9231
+recall_macro: 0.9444
+f1_macro: 0.9262
+total_samples: 57
+known_predictions: 44
+unknown_predictions: 13
+average_confidence: 92.2874
+correct_known: 1.0000
+correct_unknown: 0.7692
