@@ -1,7 +1,8 @@
-import cv2
-import face_recognition
-import numpy as np
 import os
+import cv2
+import numpy as np
+import face_recognition
+import pyrealsense2 as rs
 import pickle
 import time
 import threading
@@ -12,7 +13,7 @@ import logging
 class EliteFaceRecognition:
     def __init__(self, tolerance=0.6, model='hog', debug=False):
         """
-        Initialize the Face Recognition System
+        Initialize The Elite Face Recognition System
         
         Args:
             tolerance (float): Threshold for face matching (0.4-0.6 recommended)
@@ -32,19 +33,19 @@ class EliteFaceRecognition:
         self.known_names = []
         
         # Performance optimization settings
-        self.PROCESS_EVERY_N_FRAMES = 3
+        self.PROCESS_EVERY_N_FRAMES = 2
         self.RESIZE_FACTOR = 4
-        self.MAX_FACES_PER_FRAME = 5
-        self.ENCODING_JITTERS = 3  # Reduced for speed
-        self.UPSAMPLE_TIMES = 1 if model == 'hog' else 0
+        self.MAX_FACES_PER_FRAME = 3
+        self.UPSAMPLE_TIMES = 0
         
+        self.MIN_FACE_SIZE = 50
         # Frame processing variables
         self.frame_count = 0
         self.last_face_locations = []
         self.last_face_names = []
         self.last_face_confidences = []
-        self.confidence_history = {}  # For temporal smoothing
-        self.MIN_CONFIDENCE = 75      # Minimum confidence threshold for known faces
+        self.confidence_history = {}
+        self.MIN_CONFIDENCE = 75
         
         # Performance tracking
         self.fps_tracker = deque(maxlen=30)
@@ -53,11 +54,11 @@ class EliteFaceRecognition:
         # Thread-safe processing
         self.processing_lock = threading.Lock()
         self.processing_thread = None
-        self.processing_queue = Queue(maxsize=2)
-        self.result_queue = Queue(maxsize=2)
+        self.processing_queue = Queue(maxsize=1)
+        self.result_queue = Queue(maxsize=1)
         self.stop_processing = threading.Event()
         
-        self.logger.info(f" Face Recognition System initialized")
+        self.logger.info(f"The Elite Face Recognition System initialized")
         self.logger.info(f"Settings: tolerance={tolerance}, model={model}")
     
     def validate_folder_structure(self, faces_folder_path):
@@ -104,7 +105,7 @@ class EliteFaceRecognition:
             
             #  face detection with multiple attempts
             face_locations = []
-            for upsample in [1, 2]:  # Try with different upsampling
+            for upsample in [1, 2]:
                 locations = face_recognition.face_locations(
                     rgb_image,
                     model=self.model,
@@ -134,17 +135,24 @@ class EliteFaceRecognition:
 
     def _preprocess_image(self, image):
         """Improved image preprocessing"""
-        # Adaptive histogram equalization
+        height, width = image.shape[:2]
+        if width > 800 or height > 600:
+            scale = min(800/width, 600/height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            image = cv2.resize(image, (new_width, new_height))
+
+        # Convert to LAB and apply CLAHE on L channel
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
         limg = cv2.merge((clahe.apply(l), a, b))
         image = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-        
+
         # Mild sharpening
         kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
         image = cv2.filter2D(image, -1, kernel)
-        
+
         return image
     
     def create_encodings_from_images(self, faces_folder_path, save_encodings=True):
@@ -281,9 +289,11 @@ class EliteFaceRecognition:
                 processing_time = time.time() - start_time
                 self.processing_times.append(processing_time)
                 
-                # Store result if queue not full
-                if not self.result_queue.full():
-                    self.result_queue.put(result)
+                try:
+                    self.result_queue.get_nowait()  # Clear old result
+                except Empty:
+                    pass
+                self.result_queue.put(result)
                 
             except Empty:
                 continue
@@ -336,7 +346,78 @@ class EliteFaceRecognition:
         except Exception as e:
             self.logger.error(f"Matching error: {str(e)}")
             return "Error", 0
+    
+    def _initialize_realsense_camera(self):
+        """Initialize Intel RealSense camera if available"""
+        try:
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            pipeline.start(config)
+            self.logger.info("RealSense camera initialized successfully")
+            return pipeline
+        except Exception as e:
+            self.logger.warning(f"RealSense camera not available: {str(e)}")
+            return None
+    
+    def _initialize_fallback_camera(self, fallback_indices=[0, 1]):
+        """Initialize fallback camera"""
+        for idx in fallback_indices:
+            try:
+                cap = cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    self.logger.info(f"Fallback camera opened at index {idx}")
+                    self._optimize_camera_settings(cap)
+                    return cap
+                else:
+                    cap.release()
+            except Exception as e:
+                self.logger.debug(f"Failed to open camera index {idx}: {str(e)}")
+        
+        return None
 
+    def _initialize_camera(self):
+        """Initialize camera with proper fallback behavior"""
+        # First try RealSense
+        realsense_pipeline = self._initialize_realsense_camera()
+        if realsense_pipeline is not None:
+            return ('realsense', realsense_pipeline)
+        
+        # Then try fallback cameras
+        fallback_camera = self._initialize_fallback_camera()
+        if fallback_camera is not None:
+            return ('opencv', fallback_camera)
+        
+        # No cameras available
+        return (None, None)
+        
+    def _optimize_camera_settings(self, video_capture):
+        """Optimize camera settings for performance"""
+        settings = [
+            (cv2.CAP_PROP_FRAME_WIDTH, 640),
+            (cv2.CAP_PROP_FRAME_HEIGHT, 480),
+            (cv2.CAP_PROP_FPS, 30),
+            (cv2.CAP_PROP_BUFFERSIZE, 1),
+        ]
+        
+        for prop, value in settings:
+            try:
+                video_capture.set(prop, value)
+            except Exception as e:
+                self.logger.warning(f"Failed to set {prop}: {e}")
+    
+    def _get_system_info(self):
+        """Get system performance info"""
+        avg_processing_time = np.mean(self.processing_times) if self.processing_times else 0
+        current_fps = np.mean(self.fps_tracker) if self.fps_tracker else 0
+        return {
+            'fps': round(current_fps, 1),
+            'processing_time': round(avg_processing_time, 4),
+            'faces_detected': len(self.last_face_locations),
+            'known_people': len(self.known_names),
+            'frame_count': self.frame_count,
+        }
+    
     def process_frame_optimized(self, frame):
         """Optimized frame processing with better error handling"""
         try:
@@ -352,9 +433,15 @@ class EliteFaceRecognition:
                 number_of_times_to_upsample=self.UPSAMPLE_TIMES
             )
             
-            # Limit processing load
-            face_locations = face_locations[:self.MAX_FACES_PER_FRAME]
+            # Limit faces and filter small ones
+            valid_locations = []
+            for (top, right, bottom, left) in face_locations[:self.MAX_FACES_PER_FRAME]:
+                face_width = (right - left) * self.RESIZE_FACTOR
+                face_height = (bottom - top) * self.RESIZE_FACTOR
+                if face_width >= self.MIN_FACE_SIZE and face_height >= self.MIN_FACE_SIZE:
+                    valid_locations.append((top, right, bottom, left))
             
+            face_locations = valid_locations
             face_names = []
             face_confidences = []
             
@@ -408,133 +495,31 @@ class EliteFaceRecognition:
             # Dynamic color scheme
             if name == "Unknown":
                 box_color = (0, 0, 255)  # Red
-                text_bg_color = (0, 0, 200)
             elif name == "Error":
                 box_color = (128, 0, 128)  # Purple
-                text_bg_color = (100, 0, 100)
             elif confidence > 80:
-                box_color = (0, 255, 0)  # Green - high confidence
-                text_bg_color = (0, 200, 0)
-            elif confidence > 60:
-                box_color = (0, 255, 255)  # Yellow - medium confidence
-                text_bg_color = (0, 200, 200)
+                box_color = (0, 255, 0)  # Green
             else:
-                box_color = (255, 165, 0)  # Orange - low confidence
-                text_bg_color = (200, 130, 0)
+                box_color = (0, 255, 255)  # Yellow
             
-            # Draw face rectangle with variable thickness
-            thickness = 3 if confidence > 70 else 2
-            cv2.rectangle(frame, (left, top), (right, bottom), box_color, thickness)
+            # Draw face rectangle
+            cv2.rectangle(frame, (left, top), (right, bottom), box_color, 2)
             
-            # Create enhanced label
+            # Simple label
             if name == "Error":
-                label = "Processing Error"
+                label = "Error"
             elif name == "Unknown":
-                label = "Unknown Person"
+                label = "Unknown"
             else:
-                label = f"{name} ({confidence:.1f}%)"
+                label = f"{name} {confidence:.0f}%"
             
-            # Calculate text dimensions
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.6
-            text_thickness = 1
-            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
-            
-            # Draw label background with padding
-            padding = 4
-            cv2.rectangle(frame,
-                        (left, bottom - text_height - baseline - 2*padding),
-                        (left + text_width + 2*padding, bottom),
-                        text_bg_color, cv2.FILLED)
-            
-            # Draw label text
-            cv2.putText(frame, label,
-                      (left + padding, bottom - baseline - padding),
-                      font, font_scale, (255, 255, 255), text_thickness)
+            # Simple text drawing
+            cv2.putText(frame, label, (left, bottom + 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
         
         return frame
     
-    def debug_confidence_calculation(self, face_distances, tolerance):
-        """Debug method to understand confidence calculation"""
-        if self.debug:
-            for i, distance in enumerate(face_distances):
-                raw_conf = (1 - (distance / tolerance)) * 100 if distance <= tolerance else 0
-                self.logger.debug(f"Face {i}: distance={distance:.4f}, raw_confidence={raw_conf:.1f}%")
-        
-        return True
-        """Get system performance info"""
-        avg_processing_time = np.mean(self.processing_times) if self.processing_times else 0
-        current_fps = np.mean(self.fps_tracker) if self.fps_tracker else 0
-        
-        return {
-            'fps': current_fps,
-            'processing_time': avg_processing_time,
-            'faces_detected': len(self.last_face_locations),
-            'known_people': len(self.known_names)
-        }
-    
-    def _initialize_camera(self, camera_index):
-        """Robust camera initialization with multiple backends"""
-        backends = [
-            (cv2.CAP_DSHOW, "DirectShow"),
-            (cv2.CAP_V4L2, "V4L2"),
-            (cv2.CAP_ANY, "Default")
-        ]
-        
-        for backend, backend_name in backends:
-            try:
-                self.logger.info(f"Trying {backend_name} backend for camera {camera_index}")
-                video_capture = cv2.VideoCapture(camera_index, backend)
-                
-                if video_capture.isOpened():
-                    # Test frame read
-                    ret, test_frame = video_capture.read()
-                    if ret and test_frame is not None:
-                        self.logger.info(f"✓ Camera {camera_index} initialized with {backend_name}")
-                        return video_capture
-                    else:
-                        video_capture.release()
-                
-            except Exception as e:
-                self.logger.debug(f"{backend_name} backend failed: {str(e)}")
-                continue
-        
-        return None
-    
-    def _optimize_camera_settings(self, video_capture):
-        """Optimize camera settings for performance"""
-        settings = [
-            (cv2.CAP_PROP_FRAME_WIDTH, 640),
-            (cv2.CAP_PROP_FRAME_HEIGHT, 480),
-            (cv2.CAP_PROP_FPS, 30),
-            (cv2.CAP_PROP_BUFFERSIZE, 1),
-        ]
-        
-        for prop, value in settings:
-            try:
-                video_capture.set(prop, value)
-            except:
-                pass
-        
-        # Try to set MJPEG codec for better performance
-        try:
-            video_capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-        except:
-            pass
-    
-    def _get_system_info(self):
-        """Get system performance info"""
-        avg_processing_time = np.mean(self.processing_times) if self.processing_times else 0
-        current_fps = np.mean(self.fps_tracker) if self.fps_tracker else 0
-        
-        return {
-            'fps': current_fps,
-            'processing_time': avg_processing_time,
-            'faces_detected': len(self.last_face_locations),
-            'known_people': len(self.known_names)
-        }
-    
-    def run_real_time_recognition(self, camera_index=0, use_threading=False):
+    def run_real_time_recognition(self, use_threading=False):
         """ real-time recognition with better performance monitoring"""
         self.logger.info("Starting enhanced real-time face recognition...")
         self.logger.info("Controls: 'q'/ESC=quit, 's'=screenshot, 'r'=reset, 'd'=debug toggle")
@@ -544,72 +529,57 @@ class EliteFaceRecognition:
             return False
         
         # Initialize camera
-        video_capture = self._initialize_camera(camera_index)
+        camera_type, video_capture = self._initialize_camera()
         if video_capture is None:
-            self.logger.error(f"Cannot access camera {camera_index}")
+            self.logger.error("No usable camera found!")
             return False
         
-        # Optimize camera settings
-        self._optimize_camera_settings(video_capture)
-        
-        # Get camera info
-        width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(video_capture.get(cv2.CAP_PROP_FPS))
-        
-        self.logger.info(f"Camera settings: {width}x{height} @ {fps}fps")
-        
-        # Start background processing thread if enabled
+        # Start background processing thread
         if use_threading:
             self.processing_thread = threading.Thread(target=self._threaded_processing)
             self.processing_thread.daemon = True
             self.processing_thread.start()
-            self.logger.info("Background processing thread started")
+            self.logger.info("Background processing enabled")
         
         # Performance tracking
         fps_start_time = time.time()
         fps_frame_count = 0
-        consecutive_failures = 0
-        max_consecutive_failures = 5
-        
+       
         # Create window
-        window_name = ' Face Recognition'
+        window_name = 'The Elite Face Recognition System'
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-        
+
         try:
             while True:
-                ret, frame = video_capture.read()
-                
-                if not ret or frame is None:
-                    consecutive_failures += 1
-                    self.logger.warning(f"Frame read failed ({consecutive_failures}/{max_consecutive_failures})")
-                    
-                    if consecutive_failures >= max_consecutive_failures:
-                        self.logger.error("Too many consecutive failures, stopping...")
-                        break
-                    
-                    time.sleep(0.1)
-                    continue
-                
-                consecutive_failures = 0
+                # Read frame based on camera type
+                if camera_type == 'realsense':
+                    try:
+                        frames = video_capture.wait_for_frames()
+                        color_frame = frames.get_color_frame()
+                        if not color_frame:
+                            continue
+                        frame = np.asanyarray(color_frame.get_data())
+                    except Exception as e:
+                        self.logger.warning(f"RealSense frame read failed: {str(e)}")
+                        continue
+                else:
+                    ret, frame = video_capture.read()
+                    if not ret:
+                        continue
+
                 self.frame_count += 1
                 fps_frame_count += 1
                 
                 # Process frame
                 if use_threading and self.frame_count % self.PROCESS_EVERY_N_FRAMES == 0:
-                    # Add to processing queue if not full
                     if not self.processing_queue.full():
                         self.processing_queue.put(frame.copy())
-                    
-                    # Get latest result if available
                     try:
                         result = self.result_queue.get_nowait()
                         self.last_face_locations, self.last_face_names, self.last_face_confidences = result
                     except Empty:
                         pass
-                
                 elif not use_threading and self.frame_count % self.PROCESS_EVERY_N_FRAMES == 0:
-                    # Direct processing
                     self.last_face_locations, self.last_face_names, self.last_face_confidences = self.process_frame_optimized(frame)
                 
                 # Draw results
@@ -624,24 +594,11 @@ class EliteFaceRecognition:
                     fps_start_time = current_time
                     fps_frame_count = 0
                 
-                # Draw enhanced info overlay
+                # Display performance info
                 info = self._get_system_info()
-                y_offset = 25
-                info_items = [
-                    f"FPS: {info['fps']:.1f}",
-                    f"Faces: {info['faces_detected']}",
-                    f"Known: {info['known_people']}",
-                    f"Model: {self.model.upper()}",
-                    f"Tolerance: {self.tolerance}"
-                ]
-                
-                if self.processing_times:
-                    info_items.append(f"Proc: {info['processing_time']*1000:.1f}ms")
-                
-                for item in info_items:
-                    cv2.putText(frame, item, (10, y_offset), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    y_offset += 25
+                perf_text = f"FPS: {info['fps']:.1f} | Faces: {info['faces_detected']} | Proc: {info['processing_time']*1000:.1f}ms"
+                cv2.putText(frame, perf_text, (10, 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 # Display frame
                 cv2.imshow(window_name, frame)
@@ -660,9 +617,6 @@ class EliteFaceRecognition:
                     self.last_face_names = []
                     self.last_face_confidences = []
                     self.logger.info("Face detection reset")
-                elif key == ord('d'):  # Toggle debug
-                    self.debug = not self.debug
-                    self.logger.info(f"Debug mode: {'ON' if self.debug else 'OFF'}")
         
         except KeyboardInterrupt:
             self.logger.info("Interrupted by user")
@@ -673,23 +627,25 @@ class EliteFaceRecognition:
             if use_threading:
                 self.stop_processing.set()
                 if self.processing_thread and self.processing_thread.is_alive():
-                    self.processing_thread.join(timeout=2)
-            
-            video_capture.release()
+                    self.processing_thread.join(timeout=1)
+            if camera_type == 'realsense':
+                video_capture.stop()
+            else:
+                video_capture.release()
             cv2.destroyAllWindows()
-            self.logger.info("System shutdown complete")
+            self.logger.info("The Elite Face Recognition System shutdown complete")
         
         return True
 
 def main():
     """main function with better CLI interface"""
-    print("🚀 Elite Face Recognition System")
+    print("🚀 The Elite Face Recognition System")
     
     # Get user preferences
     tolerance = float(input("Enter tolerance (0.4-0.6, default 0.5): ") or "0.5")
     model = input("Enter model (hog/cnn, default hog): ").lower() or "hog"
     debug = input("Enable debug mode? (y/n, default n): ").lower() == 'y'
-    use_threading = input("Use background processing? (y/n, default n): ").lower() == 'y'
+    use_threading = input("Use background processing? (y/n, default y): ").lower() == 'n'
     
     # Initialize system
     face_system = EliteFaceRecognition(
@@ -704,29 +660,17 @@ def main():
         encoding_file = "face_encodings.pkl"
     
     if not face_system.load_encodings(encoding_file):
-        print("\n🔧 Creating new encodings...")
+        print("\nCreating new encodings...")
         faces_folder = input("Enter faces folder path (default: dataset/known_faces): ").strip()
         if not faces_folder:
             faces_folder = "dataset/known_faces"
         
         if not face_system.create_encodings_from_images(faces_folder):
-            print("❌ Failed to create encodings. Exiting.")
+            print("Failed to create encodings. Exiting.")
             return
     
-    # Camera selection
-    camera_indices = input("Camera indices to try (comma-separated, default: 0,1,2): ").strip()
-    if camera_indices:
-        camera_list = [int(x.strip()) for x in camera_indices.split(',')]
-    else:
-        camera_list = [0, 1, 2]
-    
-    # Try cameras
-    for camera_idx in camera_list:
-        print(f"\n🔄 Trying camera {camera_idx}...")
-        if face_system.run_real_time_recognition(camera_idx, use_threading):
-            break
-    else:
-        print("❌ Could not access any camera")
+    # Run recognition
+    face_system.run_real_time_recognition(use_threading)
 
 if __name__ == "__main__":
     main()
