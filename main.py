@@ -645,7 +645,7 @@ def main():
     tolerance = float(input("Enter tolerance (0.4-0.6, default 0.5): ") or "0.5")
     model = input("Enter model (hog/cnn, default hog): ").lower() or "hog"
     debug = input("Enable debug mode? (y/n, default n): ").lower() == 'y'
-    use_threading = input("Use background processing? (y/n, default y): ").lower() == 'n'
+    use_threading = input("Use background processing? (y/n, default y): ").lower() != 'n'
     
     # Initialize system
     face_system = EliteFaceRecognition(
